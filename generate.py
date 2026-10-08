@@ -20,6 +20,8 @@ from pyramid_jit import (
     set_attention_backend,
 )
 from pyramid_jit.attention import BACKENDS
+from pyramid_jit.fast import enable_fast_flags
+from pyramid_jit.quant_convrot import quantize_model_convrot
 
 
 # --------------------------------
@@ -56,7 +58,16 @@ def parse_args() -> argparse.Namespace:
              "the H100 SXM draw (seeds then give different images on different GPU models)")
     parser.add_argument(
         "--attention_backend", type=str, default="auto", choices=BACKENDS,
-        help="auto: FlashAttention-3 if installed, else PyTorch SDPA")
+        help="auto: FlashAttention-3 if installed, else PyTorch SDPA; sage: SageAttention")
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Enable reduced-precision CUDA math and cuDNN autotuning")
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Compile the DiT with torch.compile")
+    parser.add_argument(
+        "--convrot", action="store_true",
+        help="Replace trunk projections with ConvRot INT8 linear layers")
     parser.add_argument("--out_dir", type=str, default="outputs", help="Where to write PNGs")
     return parser.parse_args()
 
@@ -74,6 +85,9 @@ def main() -> None:
         noise_sm_count=None if args.native_noise else SamplerConfig().noise_sm_count,
     )
 
+    if args.fast:
+        enable_fast_flags()
+        print("fast CUDA flags: enabled")
     set_attention_backend(backend=args.attention_backend)
     print(f"attention backend: {active_attention_backend()}")
     model = PyramidJiT.from_pretrained(weights_dir=args.weights, device="cuda")
@@ -81,6 +95,13 @@ def main() -> None:
         model_path=args.qwen_model_path,
         extraction_layers=model.config.text_layers,
         max_length=model.config.text_len)
+
+    if args.convrot:
+        print("ConvRot INT8: quantizing trunk projections")
+        quantize_model_convrot(model=model)
+    if args.compile:
+        print("torch.compile: enabled")
+        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
 
     os.makedirs(args.out_dir, exist_ok=True)
     seed_groups: List[List[int]] = [[s] for s in seeds] if args.one_seed_per_call else [seeds]

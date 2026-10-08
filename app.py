@@ -1,9 +1,6 @@
 import argparse
-import os
 import time
 from typing import List, Optional
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import gradio as gr
 import torch
@@ -19,7 +16,9 @@ from pyramid_jit import (
 )
 from pyramid_jit.attention import BACKENDS
 from pyramid_jit.config import SamplerConfig
+from pyramid_jit.fast import enable_fast_flags
 from pyramid_jit.noise import StackedRandomGenerator
+from pyramid_jit.quant_convrot import quantize_model_convrot
 from pyramid_jit.sampler import MomentumBuffer, _text_kwargs, adaptive_projected_guidance
 
 # Global handles
@@ -34,8 +33,14 @@ def load_pipeline(
     qwen_path: str = "/mnt/data/models/Qwen3.5-4B",
     attention_backend: str = "auto",
     quantization: Optional[str] = "4bit",
+    fast: bool = False,
+    compile_model: bool = False,
+    convrot: bool = False,
 ):
     global MODEL, TEXT_ENCODER
+    if fast:
+        print("[*] Enabling fast CUDA flags")
+        enable_fast_flags()
     print(f"[*] Setting attention backend: {attention_backend}")
     set_attention_backend(backend=attention_backend)
     print(f"[*] Active attention backend: {active_attention_backend()}")
@@ -51,6 +56,12 @@ def load_pipeline(
         device=torch.device(DEVICE),
         quantization=quantization,
     )
+    if convrot:
+        print("[*] Quantizing trunk projections with ConvRot INT8")
+        quantize_model_convrot(model=MODEL)
+    if compile_model:
+        print("[*] Compiling PyramidJiT with torch.compile")
+        MODEL = torch.compile(MODEL, mode="reduce-overhead", dynamic=False)
     print("[+] Pipeline successfully loaded and ready!")
 
 
@@ -277,8 +288,14 @@ def main():
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--weights", type=str, default="/mnt/data/models/pyramid-jit")
     parser.add_argument("--qwen", type=str, default="/mnt/data/models/Qwen3.5-4B")
-    parser.add_argument("--backend", type=str, default="auto")
+    parser.add_argument(
+        "--attention_backend", "--backend", dest="attention_backend",
+        type=str, default="auto", choices=BACKENDS,
+        help="Attention backend, including sage")
     parser.add_argument("--quantization", type=str, default="4bit", choices=["4bit", "8bit", "none"])
+    parser.add_argument("--fast", action="store_true", help="Enable reduced-precision CUDA math and cuDNN autotuning")
+    parser.add_argument("--compile", action="store_true", help="Compile the DiT with torch.compile")
+    parser.add_argument("--convrot", action="store_true", help="Use ConvRot INT8 trunk projections")
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
@@ -286,8 +303,11 @@ def main():
     load_pipeline(
         weights_path=args.weights,
         qwen_path=args.qwen,
-        attention_backend=args.backend,
+        attention_backend=args.attention_backend,
         quantization=quant,
+        fast=args.fast,
+        compile_model=args.compile,
+        convrot=args.convrot,
     )
     demo = build_ui()
     demo.queue().launch(server_name=args.host, server_port=args.port, share=args.share)
