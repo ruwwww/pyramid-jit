@@ -16,6 +16,7 @@ from pyramid_jit import (
 )
 from pyramid_jit.attention import BACKENDS
 from pyramid_jit.config import SamplerConfig
+from pyramid_jit.cuda_graph import DiTCUDAGraphRunner
 from pyramid_jit.fast import enable_fast_flags
 from pyramid_jit.noise import StackedRandomGenerator
 from pyramid_jit.quant_convrot import quantize_model_convrot
@@ -26,6 +27,7 @@ MODEL: Optional[PyramidJiT] = None
 TEXT_ENCODER: Optional[QwenTextEncoder] = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OFFLOAD_TEXT_ENCODER = True
+USE_CUDA_GRAPH = False
 
 
 def load_pipeline(
@@ -36,8 +38,11 @@ def load_pipeline(
     fast: bool = False,
     compile_model: bool = False,
     convrot: bool = False,
+    fused_ops: bool = False,
+    cuda_graph: bool = False,
 ):
-    global MODEL, TEXT_ENCODER
+    global MODEL, TEXT_ENCODER, USE_CUDA_GRAPH
+    USE_CUDA_GRAPH = bool(cuda_graph)
     if fast:
         print("[*] Enabling fast CUDA flags")
         enable_fast_flags()
@@ -47,6 +52,9 @@ def load_pipeline(
 
     print(f"[*] Loading PyramidJiT from {weights_path}...")
     MODEL = PyramidJiT.from_pretrained(weights_dir=weights_path, device=DEVICE)
+    if fused_ops:
+        print("[*] Enabling Triton fused vector operations")
+        MODEL.enable_fused_ops()
 
     print(f"[*] Loading QwenTextEncoder from {qwen_path} (quantization: {quantization} on {DEVICE})...")
     TEXT_ENCODER = QwenTextEncoder(
@@ -123,14 +131,27 @@ def run_generation(
     t_diff_0 = time.time()
     with amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         momentum_buffer = MomentumBuffer(momentum=sampler.apg_momentum)
+        cond_graph = None
+        uncond_graph = None
         for i in range(sampler.sampling_steps):
             progress((i + 1) / sampler.sampling_steps, desc=f"Step {i+1}/{sampler.sampling_steps}")
             t = timesteps[i]
             t_int = (t * sampler.num_timesteps).long()
             t_batch = t_int.repeat(batch_size).to(DEVICE)
 
-            x_pred_cond = MODEL(x_t=x_t, t=t_batch, **cond)
-            x_pred_uncond = MODEL(x_t=x_t, t=t_batch, **uncond)
+            if USE_CUDA_GRAPH and cond_graph is None:
+                cond_graph = DiTCUDAGraphRunner(
+                    model=MODEL, x_t=x_t, t=t_batch, cond=cond,
+                    autocast_dtype=torch.bfloat16)
+                uncond_graph = DiTCUDAGraphRunner(
+                    model=MODEL, x_t=x_t, t=t_batch, cond=uncond,
+                    autocast_dtype=torch.bfloat16)
+            if cond_graph is None:
+                x_pred_cond = MODEL(x_t=x_t, t=t_batch, **cond)
+                x_pred_uncond = MODEL(x_t=x_t, t=t_batch, **uncond)
+            else:
+                x_pred_cond = cond_graph(x_t=x_t, t=t_batch, **cond)
+                x_pred_uncond = uncond_graph(x_t=x_t, t=t_batch, **uncond)
             v_cond = (x_t - x_pred_cond) / t
             v_uncond = (x_t - x_pred_uncond) / t
 
@@ -296,6 +317,8 @@ def main():
     parser.add_argument("--fast", action="store_true", help="Enable reduced-precision CUDA math and cuDNN autotuning")
     parser.add_argument("--compile", action="store_true", help="Compile the DiT with torch.compile")
     parser.add_argument("--convrot", action="store_true", help="Use ConvRot INT8 trunk projections")
+    parser.add_argument("--fused_ops", action="store_true", help="Enable Triton fused vector operations")
+    parser.add_argument("--cuda_graph", action="store_true", help="Capture static CUDA graphs for DiT forwards")
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
 
@@ -308,6 +331,8 @@ def main():
         fast=args.fast,
         compile_model=args.compile,
         convrot=args.convrot,
+        fused_ops=args.fused_ops,
+        cuda_graph=args.cuda_graph,
     )
     demo = build_ui()
     demo.queue().launch(server_name=args.host, server_port=args.port, share=args.share)

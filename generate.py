@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--convrot", action="store_true",
         help="Replace trunk projections with ConvRot INT8 linear layers")
+    parser.add_argument(
+        "--fused_ops", action="store_true",
+        help="Enable Triton fused vector operations in the DiT")
+    parser.add_argument(
+        "--cuda_graph", action="store_true",
+        help="Capture static CUDA graphs for conditional and unconditional DiT forwards")
     parser.add_argument("--out_dir", type=str, default="outputs", help="Where to write PNGs")
     return parser.parse_args()
 
@@ -91,6 +97,9 @@ def main() -> None:
     set_attention_backend(backend=args.attention_backend)
     print(f"attention backend: {active_attention_backend()}")
     model = PyramidJiT.from_pretrained(weights_dir=args.weights, device="cuda")
+    if args.fused_ops:
+        model.enable_fused_ops()
+        print("fused Triton ops: enabled")
     text_encoder = QwenTextEncoder(
         model_path=args.qwen_model_path,
         extraction_layers=model.config.text_layers,
@@ -108,7 +117,7 @@ def main() -> None:
     for group in seed_groups:
         images = generate(
             model=model, text_encoder=text_encoder, prompt=args.prompt, seeds=group,
-            sampler=sampler)
+            sampler=sampler, cuda_graph=args.cuda_graph)
         for seed, image in zip(group, images):
             path = os.path.join(args.out_dir, f"seed_{seed}.png")
             save_png(image=image, path=path)

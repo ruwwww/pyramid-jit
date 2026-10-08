@@ -17,6 +17,7 @@ import torch.amp as amp
 from tqdm import tqdm
 
 from pyramid_jit.config import SamplerConfig
+from pyramid_jit.cuda_graph import DiTCUDAGraphRunner
 from pyramid_jit.noise import StackedRandomGenerator
 
 
@@ -33,7 +34,8 @@ def generate(
         sampler: SamplerConfig,
         negative_prompt: Optional[str] = None,
         device: str = "cuda",
-        quiet: bool = False) -> List[torch.Tensor]:
+        quiet: bool = False,
+        cuda_graph: bool = False) -> List[torch.Tensor]:
     """
     Sample one image per seed for a prompt.
 
@@ -56,6 +58,9 @@ def generate(
             CUDA device string.
         quiet (bool):
             Suppress the progress bar.
+        cuda_graph (bool):
+            Capture separate static CUDA graphs for the conditional and unconditional model
+            forwards.  The graph is specific to this batch and spatial/text shape.
 
     Returns:
         List[torch.Tensor]:
@@ -83,14 +88,27 @@ def generate(
 
     with amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         momentum_buffer = MomentumBuffer(momentum=sampler.apg_momentum)
+        cond_graph = None
+        uncond_graph = None
         for i in tqdm(range(sampler.sampling_steps), disable=quiet):
             t = timesteps[i]
             t_next = timesteps[i + 1]
             t_int = (t * sampler.num_timesteps).long()
             t_batch = t_int.repeat(batch_size).to(device)
 
-            x_pred_cond = model(x_t=x_t, t=t_batch, **cond)
-            x_pred_uncond = model(x_t=x_t, t=t_batch, **uncond)
+            if cuda_graph and cond_graph is None:
+                cond_graph = DiTCUDAGraphRunner(
+                    model=model, x_t=x_t, t=t_batch, cond=cond,
+                    autocast_dtype=torch.bfloat16)
+                uncond_graph = DiTCUDAGraphRunner(
+                    model=model, x_t=x_t, t=t_batch, cond=uncond,
+                    autocast_dtype=torch.bfloat16)
+            if cond_graph is None:
+                x_pred_cond = model(x_t=x_t, t=t_batch, **cond)
+                x_pred_uncond = model(x_t=x_t, t=t_batch, **uncond)
+            else:
+                x_pred_cond = cond_graph(x_t=x_t, t=t_batch, **cond)
+                x_pred_uncond = uncond_graph(x_t=x_t, t=t_batch, **uncond)
             v_cond = (x_t - x_pred_cond) / t
             v_uncond = (x_t - x_pred_uncond) / t
 
