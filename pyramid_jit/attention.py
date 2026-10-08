@@ -17,7 +17,7 @@ Description: Variable-length self-attention for P-JiT with three backends:
 """
 
 import warnings
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -120,7 +120,7 @@ def varlen_attention(
         k: torch.Tensor,
         v: torch.Tensor,
         mask: torch.Tensor,
-        varlen_meta: VarlenMeta) -> torch.Tensor:
+        varlen_meta: Optional[VarlenMeta]) -> torch.Tensor:
     """
     Self-attention over the valid positions of each sample.
 

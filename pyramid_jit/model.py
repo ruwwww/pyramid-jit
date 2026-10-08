@@ -33,8 +33,19 @@ import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pyramid_jit.attention import VarlenMeta, build_varlen_metadata, varlen_attention
+from pyramid_jit.attention import (
+    VarlenMeta,
+    active_attention_backend,
+    build_varlen_metadata,
+    varlen_attention,
+)
 from pyramid_jit.config import PyramidJiTConfig
+from pyramid_jit.fused_ops import (
+    fused_adaln_norm,
+    fused_apply_rope,
+    fused_gate_residual_norm,
+    fused_swiglu,
+)
 
 WEIGHTS_FILENAME = "model.safetensors"
 CONFIG_FILENAME = "config.json"
@@ -49,7 +60,7 @@ class PyramidJiT(nn.Module):
     One in-context diffusion transformer with text + image refiner pre-streams.
     """
 
-    def __init__(self, config: PyramidJiTConfig):
+    def __init__(self, config: PyramidJiTConfig, use_fused_ops: bool = False):
         """
         Build the DiT from the architecture config.
 
@@ -60,6 +71,7 @@ class PyramidJiT(nn.Module):
         super().__init__()
         dim = config.dim
         self.config = config
+        self.use_fused_ops = bool(use_fused_ops)
         self.patch = tuple(config.patch)
 
         self.patch_embed = BottleneckPatchEmbed(
@@ -78,7 +90,8 @@ class PyramidJiT(nn.Module):
             nn.Linear(dim, dim, bias=False))
 
         block_kwargs = dict(
-            dim=dim, num_heads=config.num_heads, eps=config.eps, adaln_rank=config.adaln_rank)
+            dim=dim, num_heads=config.num_heads, eps=config.eps, adaln_rank=config.adaln_rank,
+            use_fused_ops=self.use_fused_ops)
         self.image_refiner = nn.ModuleList([
             Block(ffn_dim=config.refiner_ffn_dim, **block_kwargs)
             for _ in range(config.refiner_blocks)])
@@ -110,6 +123,14 @@ class PyramidJiT(nn.Module):
     def text_len(self) -> int:
         """Padded caption length the model expects."""
         return self.config.text_len
+
+    def enable_fused_ops(self, enabled: bool = True) -> "PyramidJiT":
+        """Enable or disable the opt-in Triton vector-operation paths."""
+        self.use_fused_ops = bool(enabled)
+        for module in self.modules():
+            if isinstance(module, Block):
+                module.enable_fused_ops(enabled=self.use_fused_ops)
+        return self
 
     def forward(
             self,
@@ -166,7 +187,9 @@ class PyramidJiT(nn.Module):
         text_emb = self.text_proj(text)                                       # [B, L_t, dim]
 
         # Image refiner: image tokens only, usual (t, h, w) RoPE.
-        img_meta = build_varlen_metadata(mask=img_mask)
+        img_meta = (
+            None if active_attention_backend() == "sdpa"
+            else build_varlen_metadata(mask=img_mask))
         img_rope = build_rope_table(
             freqs=self.freqs, f_s=f_p, h_s=h_p, w_s=w_p, text_len=0)
         for block in self.image_refiner:
@@ -175,7 +198,9 @@ class PyramidJiT(nn.Module):
 
         # Text refiner: caption tokens only, all at the identity rotation.
         text_mask = build_text_mask(seq_len=self.text_len, lengths=text_lens)
-        text_meta = build_varlen_metadata(mask=text_mask)
+        text_meta = (
+            None if active_attention_backend() == "sdpa"
+            else build_varlen_metadata(mask=text_mask))
         text_rope = build_rope_table(
             freqs=self.freqs, f_s=0, h_s=0, w_s=0, text_len=self.text_len)
         for block in self.text_refiner:
@@ -187,7 +212,7 @@ class PyramidJiT(nn.Module):
         seq = torch.cat([x_img, text_emb], dim=1)
         mask = torch.cat([img_mask, text_mask], dim=1)
         seq = seq.masked_fill(~mask.unsqueeze(-1), 0.0)
-        meta = build_varlen_metadata(mask=mask)
+        meta = None if active_attention_backend() == "sdpa" else build_varlen_metadata(mask=mask)
         rope = build_rope_table(
             freqs=self.freqs, f_s=f_p, h_s=h_p, w_s=w_p, text_len=self.text_len)
         for block in self.blocks:
@@ -204,7 +229,8 @@ class PyramidJiT(nn.Module):
             cls,
             weights_dir: str,
             device: str = "cuda",
-            dtype: Optional[torch.dtype] = torch.bfloat16) -> "PyramidJiT":
+            dtype: Optional[torch.dtype] = torch.bfloat16,
+            use_fused_ops: bool = False) -> "PyramidJiT":
         """
         Load the released weights (`config.json` + `model.safetensors`).
 
@@ -230,7 +256,7 @@ class PyramidJiT(nn.Module):
                 repo_id=weights_dir, allow_patterns=[CONFIG_FILENAME, WEIGHTS_FILENAME])
         config = PyramidJiTConfig.from_json(path=os.path.join(weights_dir, CONFIG_FILENAME))
         with torch.device("meta"):
-            model = cls(config=config)
+            model = cls(config=config, use_fused_ops=use_fused_ops)
         state = load_file(os.path.join(weights_dir, WEIGHTS_FILENAME), device="cpu")
         if dtype is not None and dtype != torch.float32:
             state = {k: v.to(dtype) for k, v in state.items()}
@@ -258,7 +284,8 @@ class Block(nn.Module):
             ffn_dim: int,
             num_heads: int,
             eps: float,
-            adaln_rank: int):
+            adaln_rank: int,
+            use_fused_ops: bool = False):
         """
         Build the block.
 
@@ -275,13 +302,23 @@ class Block(nn.Module):
                 Width of the shared low-rank conditioning vector.
         """
         super().__init__()
+        self.use_fused_ops = bool(use_fused_ops)
         self.norm1 = RMSNorm(dim=dim, eps=eps)
-        self.attn = SelfAttention(dim=dim, num_heads=num_heads, eps=eps)
+        self.attn = SelfAttention(
+            dim=dim, num_heads=num_heads, eps=eps, use_fused_ops=self.use_fused_ops)
         self.post_norm1 = RMSNorm(dim=dim, eps=eps)
         self.norm2 = RMSNorm(dim=dim, eps=eps)
-        self.ffn = SwiGLUFFN(dim=dim, hidden_dim=ffn_dim)
+        self.ffn = SwiGLUFFN(
+            dim=dim, hidden_dim=ffn_dim, use_fused_ops=self.use_fused_ops)
         self.post_norm2 = RMSNorm(dim=dim, eps=eps)
         self.adaln_up = nn.Linear(adaln_rank, 4 * dim)
+
+    def enable_fused_ops(self, enabled: bool = True) -> "Block":
+        """Enable or disable fused operations for this block and its submodules."""
+        self.use_fused_ops = bool(enabled)
+        self.attn.use_fused_ops = self.use_fused_ops
+        self.ffn.use_fused_ops = self.use_fused_ops
+        return self
 
     def forward(
             self,
@@ -289,7 +326,7 @@ class Block(nn.Module):
             c: torch.Tensor,
             mask: torch.Tensor,
             rope_table: torch.Tensor,
-            varlen_meta: VarlenMeta) -> torch.Tensor:
+            varlen_meta: Optional[VarlenMeta]) -> torch.Tensor:
         """
         Apply the block.
 
@@ -310,9 +347,26 @@ class Block(nn.Module):
                 Updated tokens (B, L, dim).
         """
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaln_up(c).unsqueeze(1).chunk(4, dim=2)
-        gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
+        if self.use_fused_ops:
+            normed = fused_adaln_norm(
+                x=x, scale=scale_msa, eps=self.norm1.eps, weight=self.norm1.weight)
+            y = self.attn(
+                x=normed, mask=mask, rope_table=rope_table, varlen_meta=varlen_meta)
+            x = fused_gate_residual_norm(
+                x=x, y=y, gate=gate_msa, mask=mask, eps=self.post_norm1.eps,
+                weight=self.post_norm1.weight)
+
+            normed = fused_adaln_norm(
+                x=x, scale=scale_mlp, eps=self.norm2.eps, weight=self.norm2.weight)
+            y = self.ffn(normed)
+            x = fused_gate_residual_norm(
+                x=x, y=y, gate=gate_mlp, mask=mask, eps=self.post_norm2.eps,
+                weight=self.post_norm2.weight)
+            return x
+
+        gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         y = self.attn(
             x=self.norm1(x) * scale_msa, mask=mask, rope_table=rope_table,
             varlen_meta=varlen_meta)
@@ -331,7 +385,7 @@ class SelfAttention(nn.Module):
     Multi-head self-attention with RMSNorm on q/k, 3-D RoPE, and a per-head sigmoid output gate.
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float):
+    def __init__(self, dim: int, num_heads: int, eps: float, use_fused_ops: bool = False):
         """
         Build the attention module.
 
@@ -344,6 +398,7 @@ class SelfAttention(nn.Module):
                 Epsilon for the q/k RMSNorm.
         """
         super().__init__()
+        self.use_fused_ops = bool(use_fused_ops)
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -360,7 +415,7 @@ class SelfAttention(nn.Module):
             x: torch.Tensor,
             mask: torch.Tensor,
             rope_table: torch.Tensor,
-            varlen_meta: VarlenMeta) -> torch.Tensor:
+            varlen_meta: Optional[VarlenMeta]) -> torch.Tensor:
         """
         Apply attention.
 
@@ -382,11 +437,23 @@ class SelfAttention(nn.Module):
         not_valid = ~mask.unsqueeze(-1)
 
         # Mask after the projections so the biases do not leak into padded rows.
-        q = self.norm_q(self.q(x).masked_fill(not_valid, 0.0)).view(b, s, n, d)
-        k = self.norm_k(self.k(x).masked_fill(not_valid, 0.0)).view(b, s, n, d)
+        q = self.q(x).masked_fill(not_valid, 0.0)
+        k = self.k(x).masked_fill(not_valid, 0.0)
+        if self.use_fused_ops:
+            q = fused_adaln_norm(q, self.norm_q.weight, eps=self.norm_q.eps)
+            k = fused_adaln_norm(k, self.norm_k.weight, eps=self.norm_k.eps)
+        else:
+            q = self.norm_q(q)
+            k = self.norm_k(k)
+        q = q.view(b, s, n, d)
+        k = k.view(b, s, n, d)
         v = self.v(x).masked_fill(not_valid, 0.0).view(b, s, n, d)
-        q = apply_rope(x=q, rope_table=rope_table)
-        k = apply_rope(x=k, rope_table=rope_table)
+        if self.use_fused_ops:
+            q = fused_apply_rope(x=q, rope_table=rope_table)
+            k = fused_apply_rope(x=k, rope_table=rope_table)
+        else:
+            q = apply_rope(x=q, rope_table=rope_table)
+            k = apply_rope(x=k, rope_table=rope_table)
 
         attn = varlen_attention(q=q, k=k, v=v, mask=mask, varlen_meta=varlen_meta)
 
@@ -401,7 +468,12 @@ class SwiGLUFFN(nn.Module):
     SwiGLU feed-forward: w2(silu(w1 x) * w3 x), with w1/w3 packed into one Linear (w13).
     """
 
-    def __init__(self, dim: int, hidden_dim: int, multiple_of: int = 256):
+    def __init__(
+            self,
+            dim: int,
+            hidden_dim: int,
+            multiple_of: int = 256,
+            use_fused_ops: bool = False):
         """
         Build the FFN.
 
@@ -415,6 +487,7 @@ class SwiGLUFFN(nn.Module):
                 Rounding granularity. Default 256.
         """
         super().__init__()
+        self.use_fused_ops = bool(use_fused_ops)
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         self.w13 = nn.Linear(dim, 2 * hidden_dim, bias=False)
@@ -433,7 +506,8 @@ class SwiGLUFFN(nn.Module):
                 Output (..., dim).
         """
         x1, x3 = self.w13(x).chunk(2, dim=-1)
-        return self.w2(F.silu(x1) * x3)
+        hidden = fused_swiglu(x1, x3) if self.use_fused_ops else F.silu(x1) * x3
+        return self.w2(hidden)
 
 
 class RMSNorm(nn.Module):
@@ -646,7 +720,9 @@ def sinusoidal_embedding_1d(
     assert dim % 2 == 0
     half = dim // 2
     positions_float = position.to(torch.float64)
-    inv_freq = torch.pow(10000.0, -torch.arange(half).to(positions_float) / half)
+    inv_freq = torch.pow(
+        10000.0,
+        -torch.arange(half, device=positions_float.device, dtype=torch.float64) / half)
     angle_rads = torch.outer(positions_float, inv_freq)
     pos_encoding = torch.cat([torch.cos(angle_rads), torch.sin(angle_rads)], dim=1)
     return pos_encoding.to(dtype)
