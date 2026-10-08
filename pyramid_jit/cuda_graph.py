@@ -111,11 +111,12 @@ class DiTCUDAGraphRunner:
         if name not in self.static_inputs:
             raise TypeError(f"Unexpected CUDA graph input {name!r}.")
         target = self.static_inputs[name]
-        if value.shape != target.shape or value.dtype != target.dtype or value.device != target.device:
+        if value.shape != target.shape or value.device != target.device:
             raise ValueError(
                 f"CUDA graph input {name!r} must match shape={tuple(target.shape)}, "
-                f"dtype={target.dtype}, device={target.device}; got shape={tuple(value.shape)}, "
-                f"dtype={value.dtype}, device={value.device}.")
+                f"device={target.device}; got shape={tuple(value.shape)}, device={value.device}.")
+        if value.dtype != target.dtype:
+            value = value.to(dtype=target.dtype)
         target.copy_(value)
 
     @torch.inference_mode()
