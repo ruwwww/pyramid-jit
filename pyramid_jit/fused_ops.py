@@ -47,6 +47,22 @@ def _row_broadcast_info(
     return values_2d.contiguous(), value_rows, rows_per_batch
 
 
+def _expand_row_values(tensor: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Eager equivalent of the row/batch broadcasting accepted by the CUDA wrappers."""
+    width = tensor.shape[-1]
+    rows = tensor.numel() // width
+    values_2d = values.reshape(-1, width)
+    value_rows = values_2d.shape[0]
+    if value_rows == 1:
+        return values_2d.view(*([1] * (tensor.ndim - 1)), width)
+    if value_rows == rows:
+        return values_2d.view_as(tensor)
+    if tensor.ndim >= 3 and value_rows == tensor.shape[0]:
+        return values_2d.view(tensor.shape[0], *([1] * (tensor.ndim - 2)), width)
+    raise ValueError(
+        f"Cannot broadcast values with shape {values.shape} over tensor shape {tensor.shape}.")
+
+
 if triton is not None:
 
     @triton.jit
@@ -204,8 +220,8 @@ def fused_adaln_norm(
         normalized = x32 * torch.rsqrt(x32.square().mean(dim=-1, keepdim=True) + eps)
         normalized = normalized.to(x.dtype)
         if weight is not None:
-            normalized = normalized * weight
-        return (normalized * scale).to(x.dtype)
+            normalized = normalized * _expand_row_values(x, weight)
+        return (normalized * _expand_row_values(x, scale)).to(x.dtype)
 
     x_contiguous = x.contiguous()
     scale_contiguous, scale_rows, rows_per_batch = _row_broadcast_info(
@@ -244,8 +260,8 @@ def fused_gate_residual_norm(
         normalized = y32 * torch.rsqrt(y32.square().mean(dim=-1, keepdim=True) + eps)
         normalized = normalized.to(x.dtype)
         if weight is not None:
-            normalized = normalized * weight
-        result = x + gate.tanh() * normalized
+            normalized = normalized * _expand_row_values(y, weight)
+        result = x + _expand_row_values(x, gate).tanh() * normalized
         if mask is not None:
             result = torch.where(mask.unsqueeze(-1), result, x)
         return result.to(x.dtype)
@@ -308,7 +324,9 @@ def fused_apply_rope(x: torch.Tensor, rope_table: torch.Tensor) -> torch.Tensor:
 
     x_contiguous = x.contiguous()
     # view_as_real is interleaved, so the kernel can load cos and sin with adjacent offsets.
-    rope_contiguous = torch.view_as_real(rope_table).to(torch.float32).contiguous()
+    # Keep the source precision and let the kernel convert to fp32; converting a complex128
+    # table to a temporary float32 tensor here would add a full-table allocation per call.
+    rope_contiguous = torch.view_as_real(rope_table.contiguous())
     out = torch.empty_like(x_contiguous)
     half = head_dim // 2
     block_size = triton.next_power_of_2(half)
