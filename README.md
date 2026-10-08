@@ -110,14 +110,20 @@ This fork ports low-level acceleration kernels from the `comfy-kitchen` and mode
 
 ![2x2 Optimization Comparison Grid (Same Seed 42, 25 Steps, 512x512)](assets/grid_comparison_same_seed_42.png)
 
-### Benchmark Comparison (RTX 5060 Ti, Seed 42, 25 Steps @ 512x512)
+### Benchmark Comparison (RTX 5060 Ti, Seed 42, 512x512)
 
-| Configuration | Total Time | Latency / Step | Throughput | Peak VRAM | Speedup |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **1. Baseline BF16 (SDPA)** | 13.54s | 541.5 ms/step | 1.85 it/s | 7,459 MB | 1.00x |
-| **2. Fast Flags (Half-Acc + SDPA)** | 6.01s | 240.4 ms/step | 4.16 it/s | 7,460 MB | **2.25x** |
-| **3. SageAttention (BF16 + Sage)** | 6.52s | 261.0 ms/step | 3.83 it/s | 7,460 MB | **2.08x** |
-| **4. ConvRot INT8 + Sage + Fast** | **5.79s** | **231.8 ms/step** | **4.31 it/s** | **5,738 MB** | **2.34x** |
+*Note: Measured strictly on pure diffusion sampling loop (Euler ODE solver) excluding text encoder warmup:*
+
+| Configuration | 25 Steps Time | 50 Steps Time | Latency / Step | Sampling Throughput | Peak VRAM | VRAM Saving |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1. Baseline BF16 (SDPA)** | 3.71s | 7.48s | ~149 ms/step | 6.74 it/s | 7,459 MB | Baseline |
+| **2. Fast Flags (Half-Acc + SDPA)** | 3.65s | 7.32s | ~146 ms/step | 6.85 it/s | 7,460 MB | 0% |
+| **3. SageAttention (BF16 + Sage)** | 3.90s | 7.82s | ~156 ms/step | 6.41 it/s | 7,460 MB | 0% |
+| **4. ConvRot INT8 + Sage + Fast** | 4.35s | 8.70s | ~174 ms/step | 5.75 it/s | **5,738 MB** | **-1.72 GB (-23%)** |
+
+> **Analisis Karakteristik Hardware (RTX 5060 Ti SM120):**
+> - Pada resolusi $512 \times 512$ (hanya 256 token citra), PyTorch native SDPA sudah sangat optimal dan tersaturasi penuh di cache L2 Blackwell (~6.7 it/s).
+> - Optimisasi utama **ConvRot INT8** terletak pada **efisiensi memory footprint**: memangkas static VRAM dari **7.46 GB ke 5.74 GB** (hemat 1.72 GB VRAM). Ini memungkinkan model 2.2B + Qwen text encoder berjalan leluasa di GPU 8 GB/12 GB/16 GB tanpa risiko OOM atau paging memory.
 
 ### Running Optimized CLI & Web UI
 
