@@ -2,7 +2,7 @@
 
 """
 File: attention.py
-Description: Variable-length self-attention for P-JiT with two backends:
+Description: Variable-length self-attention for P-JiT with three backends:
 
       * "flash3" — the FlashAttention-3 varlen kernel (Hopper GPUs; `flash_attn_interface`
         built from github.com/Dao-AILab/flash-attention). Padded positions (caption rows past
@@ -11,6 +11,7 @@ Description: Variable-length self-attention for P-JiT with two backends:
       * "sdpa" — PyTorch's scaled_dot_product_attention with an explicit padding mask. Works
         on any GPU with no extra install; images differ from the flash3 ones only by kernel
         rounding.
+      * "sage" — SageAttention's split-INT8 variable-length kernel.
 
     The default "auto" uses flash3 when importable, else sdpa.
 """
@@ -24,13 +25,20 @@ import torch.nn.functional as F
 try:
     from flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func
     FLASH_ATTN3_AVAILABLE = True
-except ImportError:  # pragma: no cover - depends on the machine
+except (ImportError, OSError):  # pragma: no cover - depends on the machine
     _flash_attn_varlen_func = None
     FLASH_ATTN3_AVAILABLE = False
 
+try:
+    from sageattention import sageattn_varlen as _sageattn_varlen
+    SAGE_ATTENTION_AVAILABLE = True
+except (ImportError, OSError):  # pragma: no cover - depends on the machine
+    _sageattn_varlen = None
+    SAGE_ATTENTION_AVAILABLE = False
+
 VarlenMeta = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-BACKENDS = ("auto", "flash3", "sdpa")
+BACKENDS = ("auto", "flash3", "sdpa", "sage")
 _BACKEND = "auto"
 _WARNED_SDPA = False
 
@@ -45,8 +53,8 @@ def set_attention_backend(backend: str) -> None:
 
     Args:
         backend (str):
-            "auto" (flash3 if importable, else sdpa), "flash3" (error if not installed), or
-            "sdpa".
+            "auto" (flash3 if importable, else sdpa), "flash3" (error if not installed),
+            "sdpa", or "sage" (error if not installed).
     """
     global _BACKEND
     if backend not in BACKENDS:
@@ -55,6 +63,9 @@ def set_attention_backend(backend: str) -> None:
         raise RuntimeError(
             "attention backend 'flash3' requested but flash_attn_interface is not installed "
             "(build it from github.com/Dao-AILab/flash-attention, hopper/).")
+    if backend == "sage" and not SAGE_ATTENTION_AVAILABLE:
+        raise RuntimeError(
+            "attention backend 'sage' requested but sageattention is not installed.")
     _BACKEND = backend
 
 
@@ -64,7 +75,7 @@ def active_attention_backend() -> str:
 
     Returns:
         str:
-            "flash3" or "sdpa".
+            "flash3", "sdpa", or "sage".
     """
     if _BACKEND == "auto":
         return "flash3" if FLASH_ATTN3_AVAILABLE else "sdpa"
@@ -129,8 +140,9 @@ def varlen_attention(
         torch.Tensor:
             Attention output [B, L, num_heads, head_dim] in q's dtype, zeros at padding.
     """
-    if active_attention_backend() == "sdpa" or not q.is_cuda:
-        # FlashAttention-3 is CUDA-only; CPU/meta tensors always take the SDPA path.
+    backend = active_attention_backend()
+    if backend == "sdpa" or not q.is_cuda:
+        # FlashAttention-3 and SageAttention are CUDA-only; CPU/meta tensors use SDPA.
         return _sdpa_attention(q=q, k=k, v=v, mask=mask)
 
     out_dtype = q.dtype
@@ -141,7 +153,8 @@ def varlen_attention(
         packed = t.reshape(b * seq_len, num_heads, head_dim).index_select(0, flat_idx)
         return packed if packed.dtype == torch.bfloat16 else packed.to(torch.bfloat16)
 
-    x_packed = _flash_attn_varlen_func(
+    attention_fn = _sageattn_varlen if backend == "sage" else _flash_attn_varlen_func
+    x_packed = attention_fn(
         q=pack(q),
         k=pack(k),
         v=pack(v),
