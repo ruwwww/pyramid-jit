@@ -137,4 +137,3 @@ class DiTCUDAGraphRunner:
         return self.static_output
 
     __call__ = forward
-
