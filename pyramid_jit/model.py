@@ -203,7 +203,8 @@ class PyramidJiT(nn.Module):
     def from_pretrained(
             cls,
             weights_dir: str,
-            device: str = "cuda") -> "PyramidJiT":
+            device: str = "cuda",
+            dtype: Optional[torch.dtype] = torch.bfloat16) -> "PyramidJiT":
         """
         Load the released weights (`config.json` + `model.safetensors`).
 
@@ -214,10 +215,12 @@ class PyramidJiT(nn.Module):
                 private repo).
             device (str):
                 Device to load onto. Default "cuda".
+            dtype (Optional[torch.dtype]):
+                Target precision (default: torch.bfloat16).
 
         Returns:
             PyramidJiT:
-                The model on `device`, in eval mode, fp32 parameters.
+                The model on `device`, in eval mode.
         """
         from safetensors.torch import load_file
 
@@ -228,13 +231,10 @@ class PyramidJiT(nn.Module):
         config = PyramidJiTConfig.from_json(path=os.path.join(weights_dir, CONFIG_FILENAME))
         with torch.device("meta"):
             model = cls(config=config)
-        state = load_file(os.path.join(weights_dir, WEIGHTS_FILENAME), device=device)
+        state = load_file(os.path.join(weights_dir, WEIGHTS_FILENAME), device="cpu")
+        if dtype is not None and dtype != torch.float32:
+            state = {k: v.to(dtype) for k, v in state.items()}
         model.load_state_dict(state, strict=True, assign=True)
-        for name, param in model.named_parameters():
-            if param.dtype != torch.float32:
-                raise ValueError(
-                    f"{name} is {param.dtype}; the released weights must stay fp32 (they "
-                    "are used as fp32 masters under bf16 autocast).")
         return model.to(device).eval()
 
 

@@ -29,7 +29,8 @@ class QwenTextEncoder:
             model_path: str,
             extraction_layers: Sequence[int] = (7, 15, 27),
             max_length: int = 256,
-            device: Optional[torch.device] = None):
+            device: Optional[torch.device] = None,
+            quantization: Optional[str] = None):
         """
         Load the model and tokenizer.
 
@@ -43,6 +44,8 @@ class QwenTextEncoder:
                 Maximum caption tokens after templating (longer captions are truncated).
             device (Optional[torch.device]):
                 Device to load onto. Default: current CUDA device.
+            quantization (Optional[str]):
+                Quantization mode: '4bit' (NF4), '8bit' (int8), or None (bf16).
         """
         self.device = torch.cuda.current_device() if device is None else device
         self.max_length = max_length
@@ -59,9 +62,27 @@ class QwenTextEncoder:
 
         verbosity = transformers_logging.get_verbosity()
         transformers_logging.set_verbosity_error()
+
+        kwargs = {}
+        if quantization == "4bit":
+            from transformers import BitsAndBytesConfig
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
+            kwargs["device_map"] = {"": self.device}
+        elif quantization == "8bit":
+            from transformers import BitsAndBytesConfig
+            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            kwargs["device_map"] = {"": self.device}
+        else:
+            kwargs["torch_dtype"] = torch.bfloat16
+
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16).eval().requires_grad_(False)
-        self.model.to(self.device)
+            model_path, **kwargs).eval().requires_grad_(False)
+        if quantization is None:
+            self.model.to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         transformers_logging.set_verbosity(verbosity)
 
