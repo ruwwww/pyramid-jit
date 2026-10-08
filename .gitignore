@@ -4,3 +4,4 @@ outputs/
 *.safetensors
 *.egg-info/
 uv.lock
+*.log
