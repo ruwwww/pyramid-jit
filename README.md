@@ -99,6 +99,45 @@ image on any NVIDIA GPU rather than one that depends on the GPU model. Pass `--n
 to use the local GPU's own draw. Attention runs on FlashAttention-3 when
 `flash_attn_interface` is installed and on PyTorch SDPA otherwise.
 
+## Hardware Optimizations & Benchmarks (Blackwell / Ada / ComfyUI-Kitchen Stack)
+
+This fork ports low-level acceleration kernels from the `comfy-kitchen` and modern generative inference stack directly into standalone Pyramid-JiT, enabling full execution on consumer 16 GB GPUs (tested on NVIDIA GeForce RTX 5060 Ti SM120):
+
+1. **ConvRot INT8 Linear Quantization**: Orthogonal regular Hadamard transformation ($H_{64}$) applied to weights and online activation inputs via `torch.ops.comfy_kitchen.int8_linear`, eliminating activation outlier bottlenecks and reducing static VRAM by **1.72 GB (-23%)**.
+2. **Fast Reduced-Precision Accumulation (`--fast`)**: Enables half-precision accumulation (`allow_fp16_accumulation`, `allow_bf16_reduced_precision_reduction`, and `allow_fp16_bf16_reduction_math_sdp`) for >2x faster tensor core throughput.
+3. **SageAttention Backend (`--attention_backend sage`)**: Full-attention acceleration via `sageattention.sageattn_varlen` with prompt masking and padding isolation.
+4. **Qwen3.5-4B 4-bit NF4 Text Encoder**: Quantized text encoder requiring only ~3.2 GB VRAM instead of ~9 GB.
+
+![2x2 Optimization Comparison Grid (Same Seed 42, 25 Steps, 512x512)](assets/grid_comparison_same_seed_42.png)
+
+### Benchmark Comparison (RTX 5060 Ti, Seed 42, 25 Steps @ 512x512)
+
+| Configuration | Total Time | Latency / Step | Throughput | Peak VRAM | Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1. Baseline BF16 (SDPA)** | 13.54s | 541.5 ms/step | 1.85 it/s | 7,459 MB | 1.00x |
+| **2. Fast Flags (Half-Acc + SDPA)** | 6.01s | 240.4 ms/step | 4.16 it/s | 7,460 MB | **2.25x** |
+| **3. SageAttention (BF16 + Sage)** | 6.52s | 261.0 ms/step | 3.83 it/s | 7,460 MB | **2.08x** |
+| **4. ConvRot INT8 + Sage + Fast** | **5.79s** | **231.8 ms/step** | **4.31 it/s** | **5,738 MB** | **2.34x** |
+
+### Running Optimized CLI & Web UI
+
+Launch the optimized Gradio Web UI:
+```bash
+python app.py --quantization 4bit --fast --convrot --attention_backend sage --host 0.0.0.0 --port 7860
+```
+
+Run optimized command-line generation:
+```bash
+python generate.py \
+    --weights /path/to/pyramid-jit \
+    --qwen_model_path /path/to/Qwen3.5-4B \
+    --prompt "$PROMPT" \
+    --seeds 42 \
+    --fast \
+    --convrot \
+    --attention_backend sage
+```
+
 ## Python API
 
 ```python
