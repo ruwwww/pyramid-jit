@@ -76,17 +76,18 @@ def generate(
     cond = _text_kwargs(text=text_cond, batch_size=batch_size, text_len=text_len)
     uncond = _text_kwargs(text=text_uncond, batch_size=batch_size, text_len=text_len)
 
-    # Initial noise, drawn per seed in bf16 on the device so sample k's noise depends on
+    # Initial noise, drawn per seed in model precision on the device so sample k's noise depends on
     # seeds[k] alone, and by default exactly as an H100 SXM draws it (see noise.py).
+    infer_dtype = next(model.parameters()).dtype
     generator = StackedRandomGenerator(
         device=device, seeds=seeds, sm_count=sampler.noise_sm_count)
     x_t = sampler.noise_scale * generator.randn(
         (batch_size, 3, 1, sampler.height, sampler.width),
-        dtype=torch.bfloat16, device=device)
+        dtype=infer_dtype, device=device)
 
     timesteps = torch.linspace(1.0, 0.0, sampler.sampling_steps + 1, device=device)
 
-    with amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with amp.autocast(device_type="cuda", dtype=infer_dtype):
         momentum_buffer = MomentumBuffer(momentum=sampler.apg_momentum)
         cond_graph = None
         uncond_graph = None
@@ -99,10 +100,10 @@ def generate(
             if cuda_graph and cond_graph is None:
                 cond_graph = DiTCUDAGraphRunner(
                     model=model, x_t=x_t, t=t_batch, cond=cond,
-                    autocast_dtype=torch.bfloat16)
+                    autocast_dtype=infer_dtype)
                 uncond_graph = DiTCUDAGraphRunner(
                     model=model, x_t=x_t, t=t_batch, cond=uncond,
-                    autocast_dtype=torch.bfloat16)
+                    autocast_dtype=infer_dtype)
             if cond_graph is None:
                 x_pred_cond = model(x_t=x_t, t=t_batch, **cond)
                 x_pred_uncond = model(x_t=x_t, t=t_batch, **uncond)
